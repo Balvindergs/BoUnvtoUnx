@@ -1,11 +1,11 @@
 ﻿# ==============================================================
 #  CONFIGURATION - update these values before running
 # ==============================================================
-$BO_SERVER       = "your_bo_server"
-$BO_PORT         = 6405
-$USERNAME        = "administrator"
-$PASSWORD        = "your_password"
-$AUTH_TYPE       = "secEnterprise"
+$BO_SERVER   = "your_bo_server"
+$BO_PORT     = 6405           # REST API port (HTTP) - used for logon/logoff only
+$USERNAME    = "administrator"
+$PASSWORD    = "your_password"
+$AUTH_TYPE   = "secEnterprise"
 
 $SOURCE_UNV_CUID = "AUBFikpv32Nv_c"
 $TARGET_UNX_CUID = "CX2pwjuQLcwIs_6XI"
@@ -14,15 +14,16 @@ $TARGET_UNX_NAME = "Jcxh.unx"
 $DRY_RUN = $true   # Set to $false to actually save changes
 # ==============================================================
 
-$BASE_URL  = "http://" + $BO_SERVER + ":" + $BO_PORT + "/biprws"
-$RAYLIGHT  = $BASE_URL + "/raylight/v1"
-$INFOSTORE = $BASE_URL + "/infostore"
+# Logon uses HTTP + explicit port; Raylight uses HTTPS on default port
+$REST_BASE = "http://" + $BO_SERVER + ":" + $BO_PORT + "/biprws"
+$RAYLIGHT  = "https://" + $BO_SERVER + "/biprws/raylight/v1"
 $SEP       = "=" * 60
 
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
     param($sender, $cert, $chain, $errors)
     return $true
 }
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
 $script:AuthHeaders = @{
     "Content-Type" = "application/xml"
@@ -40,7 +41,7 @@ function Invoke-BOLogon {
         "</attrs>"
 
     $resp = Invoke-RestMethod `
-        -Uri ($BASE_URL + "/logon/long") `
+        -Uri ($REST_BASE + "/logon/long") `
         -Method POST `
         -Body $xmlBody `
         -Headers $script:AuthHeaders `
@@ -64,68 +65,34 @@ function Invoke-BOLogon {
 
 function Invoke-BOLogoff {
     try {
-        Invoke-RestMethod `
-            -Uri ($BASE_URL + "/logoff") `
-            -Method POST `
-            -Headers $script:AuthHeaders `
-            -WebSession $script:WebSession | Out-Null
+        Invoke-RestMethod -Uri ($REST_BASE + "/logoff") -Method POST `
+            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
         Write-Host ("[" + (Get-Timestamp) + "] Logged off.") -ForegroundColor Gray
     } catch { }
 }
 
+# Use Raylight /documents to enumerate only real WebI documents
 function Get-AllWebiDocs {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
 
     do {
-        $encodedQuery = [Uri]::EscapeUriString($query)
-        $url = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
+        $url  = $RAYLIGHT + "/documents?limit=" + $limit + $amp + "offset=" + $offset
+        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
 
-        $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
-        $entries = $resp.entries
-        if ($null -eq $entries) { $entries = $resp.entry }
+        # Handle response shape: {documents:{document:[...]}} or {document:[...]}
+        $entries = $null
+        if ($resp.documents -and $resp.documents.document) { $entries = @($resp.documents.document) }
+        elseif ($resp.document)  { $entries = @($resp.document) }
+        elseif ($resp.documents) { $entries = @($resp.documents) }
 
-        if ($entries) { $docs.AddRange([object[]](@($entries))) }
+        if ($entries) { $docs.AddRange([object[]]$entries) }
         $offset += $limit
-    } while ($entries -and (@($entries)).Count -eq $limit)
+    } while ($entries -and $entries.Count -eq $limit)
 
     return $docs
-}
-
-# Test that the Raylight endpoint is reachable at all
-function Test-RaylightAccess {
-    try {
-        $resp = Invoke-RestMethod -Uri ($RAYLIGHT + "/documents") -Method GET `
-            -Headers $script:AuthHeaders -WebSession $script:WebSession
-        Write-Host "  [OK] Raylight /documents reachable." -ForegroundColor Green
-        return $true
-    } catch {
-        $code = $_.Exception.Response.StatusCode.value__
-        Write-Host ("  [FAIL] Raylight not reachable: HTTP " + $code + " - " + $_.Exception.Message) -ForegroundColor Red
-        return $false
-    }
-}
-
-function Open-BODocument($docId) {
-    try {
-        Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method GET `
-            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
-        return "ok"
-    } catch {
-        $code = $_.Exception.Response.StatusCode.value__
-        if ($code -eq 404) { return "skip-404" }
-        return ("fail-" + $code)
-    }
-}
-
-function Close-BODocument($docId) {
-    try {
-        Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method DELETE `
-            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
-    } catch { }
 }
 
 function Get-DataProviders($docId) {
@@ -133,14 +100,12 @@ function Get-DataProviders($docId) {
         $url  = $RAYLIGHT + "/documents/" + $docId + "/dataProviders"
         $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
 
-        # Raylight wraps DPs: {dataProviders:{dataProvider:[...]}} or {dataProvider:[...]}
-        if ($resp.dataProviders -and $resp.dataProviders.dataProvider) {
-            return @($resp.dataProviders.dataProvider)
-        }
+        if ($resp.dataProviders -and $resp.dataProviders.dataProvider) { return @($resp.dataProviders.dataProvider) }
         if ($resp.dataProviders) { return @($resp.dataProviders) }
         if ($resp.dataProvider)  { return @($resp.dataProvider) }
         return @()
     } catch {
+        Write-Host ("  [DP Error] " + $_.Exception.Message) -ForegroundColor DarkRed
         return $null
     }
 }
@@ -169,6 +134,13 @@ function Save-BODocument($docId) {
     }
 }
 
+function Close-BODocument($docId) {
+    try {
+        Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method DELETE `
+            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
+    } catch { }
+}
+
 # --- MAIN ---
 Write-Host ""
 Write-Host $SEP -ForegroundColor Cyan
@@ -181,121 +153,75 @@ Write-Host ""
 Invoke-BOLogon
 
 try {
-    # Verify Raylight is accessible before processing
-    Write-Host "Testing Raylight connectivity..." -ForegroundColor Gray
-    $rlOk = Test-RaylightAccess
-    if (-not $rlOk) {
-        Write-Host "Raylight is not accessible. Check that the Raylight service is enabled on the BO server." -ForegroundColor Red
-        return
-    }
-    Write-Host ""
-
     $docs = Get-AllWebiDocs
-    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " candidates to scan.")
+    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " WebI documents via Raylight.")
     Write-Host ""
 
-    # Counters by reason
-    $success     = 0
-    $skipped404  = 0
-    $skippedNoDp = 0
+    $success       = 0
     $skippedNoMatch = 0
-    $failed      = 0
+    $failed        = 0
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
-        $docName = if ($doc.name)    { $doc.name }
-                   elseif ($doc.title)   { $doc.title }
-                   elseif ($doc.SI_NAME) { $doc.SI_NAME }
-                   else { "ID:" + $docId }
+        $docName = if ($doc.name) { $doc.name } elseif ($doc.title) { $doc.title } else { "ID:" + $docId }
 
-        $openResult = Open-BODocument $docId
+        $dps = Get-DataProviders $docId
+        if ($null -eq $dps)   { $failed++;         continue }
+        if ($dps.Count -eq 0) { $skippedNoMatch++; continue }
 
-        if ($openResult -eq "skip-404") {
-            Write-Host ("  [SKIP-404]  " + $docName + " (ID:" + $docId + ") - not a Raylight document") -ForegroundColor DarkGray
-            $skipped404++
+        # Show DP CUIDs to help verify source CUID
+        $dpCuids = ($dps | ForEach-Object {
+            if ($_.dataSource -and $_.dataSource.cuid) { $_.dataSource.cuid }
+            elseif ($_.universe -and $_.universe.cuid) { $_.universe.cuid }
+            else { $_.cuid }
+        }) -join ", "
+        Write-Host ("  [SCAN] " + $docName + " (ID:" + $docId + ")  CUIDs: " + $dpCuids) -ForegroundColor DarkCyan
+
+        $matched = @($dps | Where-Object {
+            ($_.universe   -and $_.universe.cuid   -eq $SOURCE_UNV_CUID) -or
+            ($_.dataSource -and $_.dataSource.cuid -eq $SOURCE_UNV_CUID) -or
+            ($_.cuid -eq $SOURCE_UNV_CUID)
+        })
+
+        if ($matched.Count -eq 0) { $skippedNoMatch++; continue }
+
+        Write-Host ("[" + (Get-Timestamp) + "] MATCH: " + $docName + " (ID:" + $docId + ") - " + $matched.Count + " DP(s)") -ForegroundColor Yellow
+
+        if ($DRY_RUN) {
+            Write-Host "  [DRY RUN] Would repoint." -ForegroundColor Gray
+            $success++
             continue
         }
-        if ($openResult -ne "ok") {
-            Write-Host ("  [FAIL-OPEN] " + $docName + " (ID:" + $docId + ") - " + $openResult) -ForegroundColor Red
-            $failed++
-            continue
-        }
 
-        try {
-            $dps = Get-DataProviders $docId
-
-            if ($null -eq $dps) {
-                Write-Host ("  [FAIL-DP]  " + $docName + " (ID:" + $docId + ")") -ForegroundColor Red
-                $failed++
-                continue
-            }
-
-            if ($dps.Count -eq 0) {
-                Write-Host ("  [SKIP-NDP] " + $docName + " (ID:" + $docId + ") - no data providers") -ForegroundColor DarkGray
-                $skippedNoDp++
-                continue
-            }
-
-            # Show DP CUIDs found (helps verify CUID matching)
-            $dpCuids = ($dps | ForEach-Object {
-                $c = if ($_.dataSource) { $_.dataSource.cuid } elseif ($_.universe) { $_.universe.cuid } else { $_.cuid }
-                $c
-            }) -join ", "
-            Write-Host ("  [DPs]      " + $docName + " (ID:" + $docId + ") CUIDs: " + $dpCuids) -ForegroundColor DarkCyan
-
-            $matched = @($dps | Where-Object {
-                ($_.universe   -and $_.universe.cuid   -eq $SOURCE_UNV_CUID) -or
-                ($_.dataSource -and $_.dataSource.cuid -eq $SOURCE_UNV_CUID) -or
-                ($_.cuid -eq $SOURCE_UNV_CUID)
-            })
-
-            if ($matched.Count -eq 0) {
-                $skippedNoMatch++
-                continue
-            }
-
-            Write-Host ("[" + (Get-Timestamp) + "] MATCH: " + $docName + " (ID:" + $docId + ") - " + $matched.Count + " DP(s)") -ForegroundColor Yellow
-
-            if ($DRY_RUN) {
-                Write-Host "  [DRY RUN] Would repoint." -ForegroundColor Gray
-                $success++
-                continue
-            }
-
-            $allOk = $true
-            foreach ($dp in $matched) {
-                $dpId = $dp.id
-                if (-not $dpId -and $dp.dataProvider) { $dpId = $dp.dataProvider.id }
-                $status = Set-DataProvider $docId $dpId
-                if ($status -in @(200, 204)) {
-                    Write-Host ("  [OK] DP " + $dpId + " repointed.") -ForegroundColor Green
-                } else {
-                    Write-Host ("  [FAIL] DP " + $dpId + " HTTP " + $status) -ForegroundColor Red
-                    $allOk = $false
-                }
-            }
-
-            if ($allOk) {
-                $status = Save-BODocument $docId
-                if ($status -in @(200, 204)) {
-                    Write-Host "  [OK] Saved." -ForegroundColor Green
-                    $success++
-                } else {
-                    Write-Host ("  [FAIL] Save HTTP " + $status) -ForegroundColor Red
-                    $failed++
-                }
+        $allOk = $true
+        foreach ($dp in $matched) {
+            $dpId = $dp.id
+            $status = Set-DataProvider $docId $dpId
+            if ($status -in @(200, 204)) {
+                Write-Host ("  [OK] DP " + $dpId + " repointed.") -ForegroundColor Green
             } else {
+                Write-Host ("  [FAIL] DP " + $dpId + " HTTP " + $status) -ForegroundColor Red
+                $allOk = $false
+            }
+        }
+
+        if ($allOk) {
+            $status = Save-BODocument $docId
+            if ($status -in @(200, 204)) {
+                Write-Host "  [OK] Saved." -ForegroundColor Green
+                $success++
+            } else {
+                Write-Host ("  [FAIL] Save HTTP " + $status) -ForegroundColor Red
                 $failed++
             }
+        } else { $failed++ }
 
-        } finally {
-            Close-BODocument $docId
-        }
+        Close-BODocument $docId
     }
 
     Write-Host ""
     Write-Host $SEP -ForegroundColor Cyan
-    Write-Host (" DONE - Repointed: " + $success + " | Skipped(404): " + $skipped404 + " | Skipped(no DP): " + $skippedNoDp + " | Skipped(no match): " + $skippedNoMatch + " | Failed: " + $failed) -ForegroundColor Cyan
+    Write-Host (" DONE - Repointed: " + $success + " | No match: " + $skippedNoMatch + " | Failed: " + $failed) -ForegroundColor Cyan
     Write-Host $SEP -ForegroundColor Cyan
 
 } finally {
