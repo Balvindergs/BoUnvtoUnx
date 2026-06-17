@@ -18,11 +18,9 @@ $TARGET_UNX_CUID = ""                 # e.g. "CX2pwjuQLcwIs_6XI" (set to "" if u
 $DRY_RUN = $true   # Set to $false to actually save changes
 # ==============================================================
 
-$REST_BASE  = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
-$HTTPS_BASE = "https://" + $BO_SERVER + "/biprws"
-$INFOSTORE  = $HTTPS_BASE + "/infostore"
-$RAYLIGHT   = $HTTPS_BASE + "/raylight/v1"
-$SL         = $HTTPS_BASE + "/sl/v1"
+$REST_BASE = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
+$RAYLIGHT  = "https://" + $BO_SERVER + "/biprws/raylight/v1"
+$SL        = "https://" + $BO_SERVER + "/biprws/sl/v1"
 $SEP       = "=" * 60
 
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
@@ -110,25 +108,22 @@ function Show-Universes {
     }
 }
 
-# List base WebI reports only (SI_INSTANCE=0) via infostore, then use Raylight for DP operations
+# List WebI documents via Raylight (returns only real WebI docs)
 function Get-AllWebiDocs {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    # SI_INSTANCE=0 ensures only base reports are returned, not scheduled instances
-    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
-
     do {
-        $encodedQuery = [Uri]::EscapeDataString($query)
-        $url  = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
+        $url  = $RAYLIGHT + "/documents?limit=" + $limit + $amp + "offset=" + $offset
         $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
-        $entries = $resp.entries
-        if ($null -eq $entries) { $entries = $resp.entry }
-        if ($entries) { $docs.AddRange([object[]](@($entries))) }
+        $entries = $null
+        if ($resp.documents -and $resp.documents.document) { $entries = @($resp.documents.document) }
+        elseif ($resp.document)  { $entries = @($resp.document) }
+        elseif ($resp.documents) { $entries = @($resp.documents) }
+        if ($entries) { $docs.AddRange([object[]]$entries) }
         $offset += $limit
-    } while ($entries -and (@($entries)).Count -eq $limit)
-
+    } while ($entries -and $entries.Count -eq $limit)
     return $docs
 }
 
@@ -228,7 +223,7 @@ try {
     Write-Host ""
 
     $docs = Get-AllWebiDocs
-    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " base WebI reports (SI_INSTANCE=0).")
+    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " WebI documents via Raylight.")
     Write-Host ""
 
     $success        = 0
@@ -237,7 +232,7 @@ try {
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
-        $docName = if ($doc.name) { $doc.name } elseif ($doc.title) { $doc.title } elseif ($doc.SI_NAME) { $doc.SI_NAME } else { "ID:" + $docId }
+        $docName = if ($doc.name) { $doc.name } elseif ($doc.title) { $doc.title } else { "ID:" + $docId }
 
         $dps = Get-DataProviders $docId
         if ($null -eq $dps)   { $failed++;         continue }
