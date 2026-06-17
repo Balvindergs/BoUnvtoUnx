@@ -108,22 +108,25 @@ function Show-Universes {
     }
 }
 
-# List WebI documents via Raylight (returns only real WebI docs)
+# List base WebI reports only (SI_INSTANCE=0) via infostore, then use Raylight for DP operations
 function Get-AllWebiDocs {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0
     $limit  = 50
     $amp    = [char]38
+    # SI_INSTANCE=0 ensures only base reports are returned, not scheduled instances
+    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
+
     do {
-        $url  = $RAYLIGHT + "/documents?limit=" + $limit + $amp + "offset=" + $offset
+        $encodedQuery = [Uri]::EscapeUriString($query)
+        $url  = $REST_BASE + "/infostore?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
         $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
-        $entries = $null
-        if ($resp.documents -and $resp.documents.document) { $entries = @($resp.documents.document) }
-        elseif ($resp.document)  { $entries = @($resp.document) }
-        elseif ($resp.documents) { $entries = @($resp.documents) }
-        if ($entries) { $docs.AddRange([object[]]$entries) }
+        $entries = $resp.entries
+        if ($null -eq $entries) { $entries = $resp.entry }
+        if ($entries) { $docs.AddRange([object[]](@($entries))) }
         $offset += $limit
-    } while ($entries -and $entries.Count -eq $limit)
+    } while ($entries -and (@($entries)).Count -eq $limit)
+
     return $docs
 }
 
@@ -223,7 +226,7 @@ try {
     Write-Host ""
 
     $docs = Get-AllWebiDocs
-    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " WebI documents via Raylight.")
+    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " base WebI reports (SI_INSTANCE=0).")
     Write-Host ""
 
     $success        = 0
@@ -232,7 +235,7 @@ try {
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
-        $docName = if ($doc.name) { $doc.name } elseif ($doc.title) { $doc.title } else { "ID:" + $docId }
+        $docName = if ($doc.name) { $doc.name } elseif ($doc.title) { $doc.title } elseif ($doc.SI_NAME) { $doc.SI_NAME } else { "ID:" + $docId }
 
         $dps = Get-DataProviders $docId
         if ($null -eq $dps)   { $failed++;         continue }
