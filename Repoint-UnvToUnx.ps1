@@ -78,8 +78,8 @@ function Get-AllWebiDocs {
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    # SI_KIND='Webi' is the correct filter for WebI documents via REST API
-    $query  = "SELECT SI_ID,SI_NAME,SI_CUID FROM CI_INFOOBJECTS WHERE SI_KIND='Webi' AND SI_INSTANCE=0"
+    # SI_PROGID filter - returns WebiReport objects (may include some system objects; Raylight open will filter those out)
+    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
 
     do {
         $encodedQuery = [Uri]::EscapeUriString($query)
@@ -91,9 +91,7 @@ function Get-AllWebiDocs {
 
         if ($entries) {
             $arr = @($entries)
-            # Keep only Webi objects in case other types slip through
-            $webi = $arr | Where-Object { -not $_.type -or $_.type -eq "Webi" -or $_.type -eq "Document" }
-            if ($webi) { $docs.AddRange([object[]](@($webi))) }
+            $docs.AddRange([object[]]$arr)
         }
         $offset += $limit
     } while ($entries -and (@($entries)).Count -eq $limit)
@@ -101,23 +99,24 @@ function Get-AllWebiDocs {
     return $docs
 }
 
-# Open a document in the Raylight engine (required before accessing data providers)
+# Open document in Raylight. Returns: 'ok', 'skip' (404 - not a WebI doc), or 'fail'
 function Open-BODocument($docId) {
     try {
-        $url  = $RAYLIGHT + "/documents/" + $docId
+        $url = $RAYLIGHT + "/documents/" + $docId
         Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
-        return $true
+        return "ok"
     } catch {
-        Write-Host ("         [Open Error] HTTP " + $_.Exception.Response.StatusCode.value__ + " - " + $_.Exception.Message) -ForegroundColor DarkYellow
-        return $false
+        $code = $_.Exception.Response.StatusCode.value__
+        if ($code -eq 404) { return "skip" }
+        Write-Host ("  [Open Error] HTTP " + $code + " - " + $_.Exception.Message) -ForegroundColor DarkYellow
+        return "fail"
     }
 }
 
-# Release the document from Raylight server memory
 function Close-BODocument($docId) {
     try {
-        $url = $RAYLIGHT + "/documents/" + $docId
-        Invoke-RestMethod -Uri $url -Method DELETE -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
+        Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method DELETE `
+            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
     } catch { }
 }
 
@@ -129,7 +128,7 @@ function Get-DataProviders($docId) {
         if ($resp.dataProvider)  { return @($resp.dataProvider) }
         return @()
     } catch {
-        Write-Host ("         [DP Error] " + $_.Exception.Message) -ForegroundColor DarkRed
+        Write-Host ("  [DP Error] " + $_.Exception.Message) -ForegroundColor DarkRed
         return $null
     }
 }
@@ -137,35 +136,23 @@ function Get-DataProviders($docId) {
 function Set-DataProvider($docId, $dpId) {
     $url     = $RAYLIGHT + "/documents/" + $docId + "/dataProviders/" + $dpId
     $payload = '{"dataProvider":{"universe":{"cuid":"' + $TARGET_UNX_CUID + '","name":"' + $TARGET_UNX_NAME + '"}}}'
-
     try {
-        $resp = Invoke-WebRequest `
-            -Uri $url `
-            -Method PUT `
-            -Body $payload `
-            -Headers $script:AuthHeaders `
-            -WebSession $script:WebSession `
-            -UseBasicParsing
+        $resp = Invoke-WebRequest -Uri $url -Method PUT -Body $payload `
+            -Headers $script:AuthHeaders -WebSession $script:WebSession -UseBasicParsing
         return $resp.StatusCode
     } catch {
-        Write-Host ("         [PUT Error] " + $_.Exception.Message) -ForegroundColor DarkRed
+        Write-Host ("  [PUT Error] " + $_.Exception.Message) -ForegroundColor DarkRed
         return $_.Exception.Response.StatusCode.value__
     }
 }
 
 function Save-BODocument($docId) {
-    $url = $RAYLIGHT + "/documents/" + $docId
-
     try {
-        $resp = Invoke-WebRequest `
-            -Uri $url `
-            -Method PUT `
-            -Headers $script:AuthHeaders `
-            -WebSession $script:WebSession `
-            -UseBasicParsing
+        $resp = Invoke-WebRequest -Uri ($RAYLIGHT + "/documents/" + $docId) -Method PUT `
+            -Headers $script:AuthHeaders -WebSession $script:WebSession -UseBasicParsing
         return $resp.StatusCode
     } catch {
-        Write-Host ("         [Save Error] " + $_.Exception.Message) -ForegroundColor DarkRed
+        Write-Host ("  [Save Error] " + $_.Exception.Message) -ForegroundColor DarkRed
         return $_.Exception.Response.StatusCode.value__
     }
 }
@@ -183,7 +170,7 @@ Invoke-BOLogon
 
 try {
     $docs = Get-AllWebiDocs
-    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " WebI reports to process.")
+    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " candidates to scan.")
     Write-Host ""
 
     $success = 0
@@ -192,55 +179,37 @@ try {
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
-        $docName = if ($doc.name) { $doc.name } elseif ($doc.title) { $doc.title } else { "ID:" + $docId }
+        $docName = if ($doc.name)    { $doc.name }
+                   elseif ($doc.title)   { $doc.title }
+                   elseif ($doc.SI_NAME) { $doc.SI_NAME }
+                   else { "ID:" + $docId }
 
-        Write-Host ("[" + (Get-Timestamp) + "] Checking: " + $docName + " (ID:" + $docId + ")")
-
-        # Step 1: Open document in Raylight
-        $opened = Open-BODocument $docId
-        if (-not $opened) {
-            Write-Host ("  [WARN] Could not open document.") -ForegroundColor Yellow
-            $failed++
-            continue
-        }
+        # Open document in Raylight (404 = not a real WebI doc, silently skip)
+        $openResult = Open-BODocument $docId
+        if ($openResult -eq "skip") { $skipped++; continue }
+        if ($openResult -eq "fail") { $failed++;  continue }
 
         try {
-            # Step 2: Get data providers
             $dps = Get-DataProviders $docId
+            if ($null -eq $dps)      { $failed++;  continue }
+            if ($dps.Count -eq 0)    { $skipped++; continue }
 
-            if ($null -eq $dps) {
-                $failed++
-                continue
-            }
-
-            if ($dps.Count -eq 0) {
-                Write-Host "  [SKIP] No data providers." -ForegroundColor Gray
-                $skipped++
-                continue
-            }
-
-            # Find DPs using the source UNV CUID
             $matched = @($dps | Where-Object {
-                ($_.universe -and $_.universe.cuid -eq $SOURCE_UNV_CUID) -or
+                ($_.universe   -and $_.universe.cuid   -eq $SOURCE_UNV_CUID) -or
                 ($_.dataSource -and $_.dataSource.cuid -eq $SOURCE_UNV_CUID) -or
                 ($_.cuid -eq $SOURCE_UNV_CUID)
             })
 
-            if ($matched.Count -eq 0) {
-                Write-Host "  [SKIP] No matching UNV data provider." -ForegroundColor Gray
-                $skipped++
-                continue
-            }
+            if ($matched.Count -eq 0) { $skipped++; continue }
 
-            Write-Host ("  [MATCH] " + $matched.Count + " data provider(s) use source UNV.") -ForegroundColor Yellow
+            Write-Host ("[" + (Get-Timestamp) + "] MATCH: " + $docName + " (ID:" + $docId + ") - " + $matched.Count + " DP(s)") -ForegroundColor Yellow
 
             if ($DRY_RUN) {
-                Write-Host "  [DRY RUN] Would repoint - skipping actual change." -ForegroundColor Gray
+                Write-Host "  [DRY RUN] Would repoint." -ForegroundColor Gray
                 $success++
                 continue
             }
 
-            # Step 3: Repoint each matching DP
             $allOk = $true
             foreach ($dp in $matched) {
                 $dpId = $dp.id
@@ -254,11 +223,10 @@ try {
                 }
             }
 
-            # Step 4: Save
             if ($allOk) {
                 $status = Save-BODocument $docId
                 if ($status -in @(200, 204)) {
-                    Write-Host "  [OK] Document saved." -ForegroundColor Green
+                    Write-Host "  [OK] Saved." -ForegroundColor Green
                     $success++
                 } else {
                     Write-Host ("  [FAIL] Save HTTP " + $status) -ForegroundColor Red
