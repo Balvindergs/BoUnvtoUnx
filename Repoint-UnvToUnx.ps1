@@ -7,18 +7,19 @@ $USERNAME    = "administrator"
 $PASSWORD    = "your_password"
 $AUTH_TYPE   = "secEnterprise"
 
-# Source UNV - specify EITHER the CUID or the filename (script looks up the other)
-$SOURCE_UNV_NAME = "MyUniverse.unv"   # e.g. "Sales.unv"  (set to "" if using CUID)
-$SOURCE_UNV_CUID = ""                 # e.g. "AUBFikpv32Nv_c" (set to "" if using name)
+# Source UNV - specify EITHER the CUID or the filename
+$SOURCE_UNV_NAME = "MyUniverse.unv"
+$SOURCE_UNV_CUID = ""
 
-# Target UNX - specify EITHER the CUID or the filename (script looks up the other)
-$TARGET_UNX_NAME = "MyUniverse.unx"   # e.g. "Sales.unx"  (set to "" if using CUID)
-$TARGET_UNX_CUID = ""                 # e.g. "CX2pwjuQLcwIs_6XI" (set to "" if using name)
+# Target UNX - specify EITHER the CUID or the filename
+$TARGET_UNX_NAME = "MyUniverse.unx"
+$TARGET_UNX_CUID = ""
 
 $DRY_RUN = $true   # Set to $false to actually save changes
 # ==============================================================
 
 $REST_BASE = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
+$INFOSTORE = "https://" + $BO_SERVER + "/biprws/infostore"
 $RAYLIGHT  = "https://" + $BO_SERVER + "/biprws/raylight/v1"
 $SL        = "https://" + $BO_SERVER + "/biprws/sl/v1"
 $SEP       = "=" * 60
@@ -26,13 +27,11 @@ $SEP       = "=" * 60
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
     param($sender, $cert, $chain, $errors); return $true
 }
-# Allow TLS 1.0/1.1/1.2 - some BO servers reject TLS 1.2-only clients
 [System.Net.ServicePointManager]::SecurityProtocol = (
     [System.Net.SecurityProtocolType]::Tls12 -bor
     [System.Net.SecurityProtocolType]::Tls11 -bor
     [System.Net.SecurityProtocolType]::Tls
 )
-# Prevent "connection closed" errors on keep-alive reuse
 [System.Net.ServicePointManager]::Expect100Continue = $false
 
 $script:AuthHeaders = @{ "Content-Type" = "application/xml"; "Accept" = "application/json" }
@@ -75,7 +74,7 @@ function Invoke-BOLogoff {
     } catch { }
 }
 
-# Look up a universe CUID by filename via sl/v1/universes
+# Look up universe CUID by name via sl/v1/universes
 function Resolve-UniverseCuid($name) {
     try {
         $amp  = [char]38
@@ -116,45 +115,54 @@ function Show-Universes {
     }
 }
 
-# List WebI documents via Raylight (returns only real WebI docs)
+# List ONLY base WebI reports (SI_INSTANCE=0) via infostore - excludes all scheduled instances
 function Get-AllWebiDocs {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0
     $limit  = 50
     $amp    = [char]38
+    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
+
     do {
-        $url  = $RAYLIGHT + "/documents?limit=" + $limit + $amp + "offset=" + $offset
+        $encodedQuery = [Uri]::EscapeDataString($query)
+        $url  = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
         $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
-        $entries = $null
-        if ($resp.documents -and $resp.documents.document) { $entries = @($resp.documents.document) }
-        elseif ($resp.document)  { $entries = @($resp.document) }
-        elseif ($resp.documents) { $entries = @($resp.documents) }
-        if ($entries) { $docs.AddRange([object[]]$entries) }
+        $entries = $resp.entries
+        if ($null -eq $entries) { $entries = $resp.entry }
+        if ($entries) { $docs.AddRange([object[]](@($entries))) }
         $offset += $limit
-    } while ($entries -and $entries.Count -eq $limit)
+    } while ($entries -and (@($entries)).Count -eq $limit)
+
     return $docs
 }
 
-# GET /dataproviders (lowercase - correct SAP API casing)
+# GET /dataproviders with retry on transient connection errors
 function Get-DataProviders($docId) {
-    try {
-        $url  = $RAYLIGHT + "/documents/" + $docId + "/dataproviders"
-        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
-        # Response: {"dataproviders":[{"id":"DP0","universe":{"cuid":"..."},...}]}
-        if ($resp.dataproviders -and $resp.dataproviders.dataprovider) { return @($resp.dataproviders.dataprovider) }
-        if ($resp.dataproviders) { return @($resp.dataproviders) }
-        if ($resp.dataprovider)  { return @($resp.dataprovider) }
-        return @()
-    } catch {
-        Write-Host ("  [DP Error] " + $_.Exception.Message) -ForegroundColor DarkRed
-        return $null
+    $url = $RAYLIGHT + "/documents/" + $docId + "/dataproviders"
+    for ($i = 0; $i -le 2; $i++) {
+        try {
+            $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
+            if ($resp.dataproviders -and $resp.dataproviders.dataprovider) { return @($resp.dataproviders.dataprovider) }
+            if ($resp.dataproviders) { return @($resp.dataproviders) }
+            if ($resp.dataprovider)  { return @($resp.dataprovider) }
+            return @()
+        } catch {
+            $msg = $_.Exception.Message
+            $code = $_.Exception.Response.StatusCode.value__
+            if ($code -eq 404) { return "skip" }
+            if ($i -lt 2 -and $msg -like "*connection was closed*") {
+                Start-Sleep -Milliseconds 800
+                continue
+            }
+            Write-Host ("  [DP Error] " + $msg) -ForegroundColor DarkRed
+            return $null
+        }
     }
+    return $null
 }
 
-# PUT /dataproviders with array payload (SAP-documented format)
 function Set-DataProviders($docId, $dpIds) {
-    $url = $RAYLIGHT + "/documents/" + $docId + "/dataproviders"
-    # Build payload: {"dataproviders":[{"id":"DP0","universe":{"cuid":"...","name":"..."}},...]}
+    $url   = $RAYLIGHT + "/documents/" + $docId + "/dataproviders"
     $items = ($dpIds | ForEach-Object {
         '{"id":"' + $_ + '","universe":{"cuid":"' + $TARGET_UNX_CUID + '","name":"' + $TARGET_UNX_NAME + '"}}'
     }) -join ","
@@ -231,7 +239,7 @@ try {
     Write-Host ""
 
     $docs = Get-AllWebiDocs
-    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " WebI documents via Raylight.")
+    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " base WebI reports (SI_INSTANCE=0).")
     Write-Host ""
 
     $success        = 0
@@ -240,13 +248,16 @@ try {
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
-        $docName = if ($doc.name) { $doc.name } elseif ($doc.title) { $doc.title } else { "ID:" + $docId }
+        $docName = if ($doc.name)    { $doc.name }
+                   elseif ($doc.title)   { $doc.title }
+                   elseif ($doc.SI_NAME) { $doc.SI_NAME }
+                   else { "ID:" + $docId }
 
         $dps = Get-DataProviders $docId
+        if ($dps -eq "skip")  { $skippedNoMatch++; continue }
         if ($null -eq $dps)   { $failed++;         continue }
         if ($dps.Count -eq 0) { $skippedNoMatch++; continue }
 
-        # Show each DP's universe CUID for diagnostics
         $dpInfo = ($dps | ForEach-Object {
             $c = if ($_.universe -and $_.universe.cuid) { $_.universe.cuid }
                  elseif ($_.dataSource -and $_.dataSource.cuid) { $_.dataSource.cuid }
@@ -255,9 +266,8 @@ try {
         }) -join "  "
         Write-Host ("  [SCAN] " + $docName + " | " + $dpInfo) -ForegroundColor DarkCyan
 
-        # Find DPs whose universe CUID matches the source UNV
         $matchedIds = @($dps | Where-Object {
-            ($_.universe -and $_.universe.cuid -eq $SOURCE_UNV_CUID) -or
+            ($_.universe   -and $_.universe.cuid   -eq $SOURCE_UNV_CUID) -or
             ($_.dataSource -and $_.dataSource.cuid -eq $SOURCE_UNV_CUID)
         } | ForEach-Object { $_.id })
 
@@ -271,11 +281,9 @@ try {
             continue
         }
 
-        # Repoint all matched DPs in one PUT call
         $status = Set-DataProviders $docId $matchedIds
         if ($status -in @(200, 204)) {
             Write-Host "  [OK] Repointed." -ForegroundColor Green
-            # Save document
             $saveStatus = Save-BODocument $docId
             if ($saveStatus -in @(200, 204)) {
                 Write-Host "  [OK] Saved." -ForegroundColor Green
