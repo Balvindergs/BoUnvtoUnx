@@ -18,9 +18,11 @@ $TARGET_UNX_CUID = ""                 # e.g. "CX2pwjuQLcwIs_6XI" (set to "" if u
 $DRY_RUN = $true   # Set to $false to actually save changes
 # ==============================================================
 
-$REST_BASE = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
-$RAYLIGHT  = "https://" + $BO_SERVER + "/biprws/raylight/v1"
-$SL        = "https://" + $BO_SERVER + "/biprws/sl/v1"
+$REST_BASE  = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
+$HTTPS_BASE = "https://" + $BO_SERVER + "/biprws"
+$INFOSTORE  = $HTTPS_BASE + "/infostore"
+$RAYLIGHT   = $HTTPS_BASE + "/raylight/v1"
+$SL         = $HTTPS_BASE + "/sl/v1"
 $SEP       = "=" * 60
 
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
@@ -118,8 +120,8 @@ function Get-AllWebiDocs {
     $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
 
     do {
-        $encodedQuery = [Uri]::EscapeUriString($query)
-        $url  = $REST_BASE + "/infostore?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
+        $encodedQuery = [Uri]::EscapeDataString($query)
+        $url  = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
         $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
         $entries = $resp.entries
         if ($null -eq $entries) { $entries = $resp.entry }
