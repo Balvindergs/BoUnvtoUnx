@@ -52,7 +52,7 @@ function Invoke-BOLogon {
             Where-Object { $_.name -eq "logonToken" } |
             Select-Object -ExpandProperty "#text"
     }
-    if (-not $token) { throw "Logon failed - no token returned. Check server/credentials." }
+    if (-not $token) { throw "Logon failed - no token returned." }
 
     $script:AuthHeaders = @{
         "X-SAP-LogonToken" = ('"' + $token + '"')
@@ -78,7 +78,6 @@ function Get-AllWebiDocs {
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    # SI_PROGID filter - returns WebiReport objects (may include some system objects; Raylight open will filter those out)
     $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
 
     do {
@@ -89,27 +88,36 @@ function Get-AllWebiDocs {
         $entries = $resp.entries
         if ($null -eq $entries) { $entries = $resp.entry }
 
-        if ($entries) {
-            $arr = @($entries)
-            $docs.AddRange([object[]]$arr)
-        }
+        if ($entries) { $docs.AddRange([object[]](@($entries))) }
         $offset += $limit
     } while ($entries -and (@($entries)).Count -eq $limit)
 
     return $docs
 }
 
-# Open document in Raylight. Returns: 'ok', 'skip' (404 - not a WebI doc), or 'fail'
+# Test that the Raylight endpoint is reachable at all
+function Test-RaylightAccess {
+    try {
+        $resp = Invoke-RestMethod -Uri ($RAYLIGHT + "/documents") -Method GET `
+            -Headers $script:AuthHeaders -WebSession $script:WebSession
+        Write-Host "  [OK] Raylight /documents reachable." -ForegroundColor Green
+        return $true
+    } catch {
+        $code = $_.Exception.Response.StatusCode.value__
+        Write-Host ("  [FAIL] Raylight not reachable: HTTP " + $code + " - " + $_.Exception.Message) -ForegroundColor Red
+        return $false
+    }
+}
+
 function Open-BODocument($docId) {
     try {
-        $url = $RAYLIGHT + "/documents/" + $docId
-        Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
+        Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method GET `
+            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
         return "ok"
     } catch {
         $code = $_.Exception.Response.StatusCode.value__
-        if ($code -eq 404) { return "skip" }
-        Write-Host ("  [Open Error] HTTP " + $code + " - " + $_.Exception.Message) -ForegroundColor DarkYellow
-        return "fail"
+        if ($code -eq 404) { return "skip-404" }
+        return ("fail-" + $code)
     }
 }
 
@@ -124,11 +132,15 @@ function Get-DataProviders($docId) {
     try {
         $url  = $RAYLIGHT + "/documents/" + $docId + "/dataProviders"
         $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
+
+        # Raylight wraps DPs: {dataProviders:{dataProvider:[...]}} or {dataProvider:[...]}
+        if ($resp.dataProviders -and $resp.dataProviders.dataProvider) {
+            return @($resp.dataProviders.dataProvider)
+        }
         if ($resp.dataProviders) { return @($resp.dataProviders) }
         if ($resp.dataProvider)  { return @($resp.dataProvider) }
         return @()
     } catch {
-        Write-Host ("  [DP Error] " + $_.Exception.Message) -ForegroundColor DarkRed
         return $null
     }
 }
@@ -169,13 +181,25 @@ Write-Host ""
 Invoke-BOLogon
 
 try {
+    # Verify Raylight is accessible before processing
+    Write-Host "Testing Raylight connectivity..." -ForegroundColor Gray
+    $rlOk = Test-RaylightAccess
+    if (-not $rlOk) {
+        Write-Host "Raylight is not accessible. Check that the Raylight service is enabled on the BO server." -ForegroundColor Red
+        return
+    }
+    Write-Host ""
+
     $docs = Get-AllWebiDocs
     Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " candidates to scan.")
     Write-Host ""
 
-    $success = 0
-    $skipped = 0
-    $failed  = 0
+    # Counters by reason
+    $success     = 0
+    $skipped404  = 0
+    $skippedNoDp = 0
+    $skippedNoMatch = 0
+    $failed      = 0
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
@@ -184,15 +208,40 @@ try {
                    elseif ($doc.SI_NAME) { $doc.SI_NAME }
                    else { "ID:" + $docId }
 
-        # Open document in Raylight (404 = not a real WebI doc, silently skip)
         $openResult = Open-BODocument $docId
-        if ($openResult -eq "skip") { $skipped++; continue }
-        if ($openResult -eq "fail") { $failed++;  continue }
+
+        if ($openResult -eq "skip-404") {
+            Write-Host ("  [SKIP-404]  " + $docName + " (ID:" + $docId + ") - not a Raylight document") -ForegroundColor DarkGray
+            $skipped404++
+            continue
+        }
+        if ($openResult -ne "ok") {
+            Write-Host ("  [FAIL-OPEN] " + $docName + " (ID:" + $docId + ") - " + $openResult) -ForegroundColor Red
+            $failed++
+            continue
+        }
 
         try {
             $dps = Get-DataProviders $docId
-            if ($null -eq $dps)      { $failed++;  continue }
-            if ($dps.Count -eq 0)    { $skipped++; continue }
+
+            if ($null -eq $dps) {
+                Write-Host ("  [FAIL-DP]  " + $docName + " (ID:" + $docId + ")") -ForegroundColor Red
+                $failed++
+                continue
+            }
+
+            if ($dps.Count -eq 0) {
+                Write-Host ("  [SKIP-NDP] " + $docName + " (ID:" + $docId + ") - no data providers") -ForegroundColor DarkGray
+                $skippedNoDp++
+                continue
+            }
+
+            # Show DP CUIDs found (helps verify CUID matching)
+            $dpCuids = ($dps | ForEach-Object {
+                $c = if ($_.dataSource) { $_.dataSource.cuid } elseif ($_.universe) { $_.universe.cuid } else { $_.cuid }
+                $c
+            }) -join ", "
+            Write-Host ("  [DPs]      " + $docName + " (ID:" + $docId + ") CUIDs: " + $dpCuids) -ForegroundColor DarkCyan
 
             $matched = @($dps | Where-Object {
                 ($_.universe   -and $_.universe.cuid   -eq $SOURCE_UNV_CUID) -or
@@ -200,7 +249,10 @@ try {
                 ($_.cuid -eq $SOURCE_UNV_CUID)
             })
 
-            if ($matched.Count -eq 0) { $skipped++; continue }
+            if ($matched.Count -eq 0) {
+                $skippedNoMatch++
+                continue
+            }
 
             Write-Host ("[" + (Get-Timestamp) + "] MATCH: " + $docName + " (ID:" + $docId + ") - " + $matched.Count + " DP(s)") -ForegroundColor Yellow
 
@@ -243,7 +295,7 @@ try {
 
     Write-Host ""
     Write-Host $SEP -ForegroundColor Cyan
-    Write-Host (" DONE - Repointed: " + $success + " | Skipped: " + $skipped + " | Failed: " + $failed) -ForegroundColor Cyan
+    Write-Host (" DONE - Repointed: " + $success + " | Skipped(404): " + $skipped404 + " | Skipped(no DP): " + $skippedNoDp + " | Skipped(no match): " + $skippedNoMatch + " | Failed: " + $failed) -ForegroundColor Cyan
     Write-Host $SEP -ForegroundColor Cyan
 
 } finally {
