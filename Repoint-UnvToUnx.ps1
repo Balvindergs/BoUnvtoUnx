@@ -28,7 +28,7 @@ $SEP       = "=" * 60
 }
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
-$script:AuthHeaders = @{ "Content-Type" = "application/xml"; "Accept" = "application/xml" }
+$script:AuthHeaders = @{ "Content-Type" = "application/xml"; "Accept" = "application/json" }
 $script:WebSession  = $null
 
 function Get-Timestamp { Get-Date -Format "HH:mm:ss" }
