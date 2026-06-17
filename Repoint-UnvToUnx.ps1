@@ -26,7 +26,14 @@ $SEP       = "=" * 60
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
     param($sender, $cert, $chain, $errors); return $true
 }
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+# Allow TLS 1.0/1.1/1.2 - some BO servers reject TLS 1.2-only clients
+[System.Net.ServicePointManager]::SecurityProtocol = (
+    [System.Net.SecurityProtocolType]::Tls12 -bor
+    [System.Net.SecurityProtocolType]::Tls11 -bor
+    [System.Net.SecurityProtocolType]::Tls
+)
+# Prevent "connection closed" errors on keep-alive reuse
+[System.Net.ServicePointManager]::Expect100Continue = $false
 
 $script:AuthHeaders = @{ "Content-Type" = "application/xml"; "Accept" = "application/json" }
 $script:WebSession  = $null
@@ -55,6 +62,7 @@ function Invoke-BOLogon {
         "X-SAP-LogonToken" = ('"' + $token + '"')
         "Accept"           = "application/json"
         "Content-Type"     = "application/json"
+        "Connection"       = "close"
     }
     Write-Host ("[" + (Get-Timestamp) + "] Logged in as " + $USERNAME) -ForegroundColor Green
 }
