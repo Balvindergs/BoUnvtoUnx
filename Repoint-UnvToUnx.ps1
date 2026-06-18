@@ -126,13 +126,14 @@ function Resolve-UniverseSIID($name) {
     return $null
 }
 
-# Find base WebI reports linked to a universe via PARENTS() CMS relationship query
-function Get-LinkedWebiDocs($universeName) {
+# Get all base WebI reports. Universe filtering is handled naturally by the mappings endpoint:
+# GET /dataproviders/mappings only succeeds for DPs compatible with the target UNX.
+function Get-AllWebiDocs {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE PARENTS(`"SI_NAME='webi-universe'`",`"SI_NAME='$universeName'`") AND SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0 AND SI_RECURRING=0"
+    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0 AND SI_RECURRING=0"
 
     do {
         $encodedQuery = [Uri]::EscapeDataString($query)
@@ -252,8 +253,8 @@ try {
     Write-Host (" Target UNX : " + $TARGET_UNX_NAME + "  [SI_ID=" + $TARGET_UNX_ID + "]")
     Write-Host ""
 
-    $docs = Get-LinkedWebiDocs $SOURCE_UNV_NAME
-    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " linked WebI report(s).")
+    $docs = Get-AllWebiDocs
+    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " base WebI report(s). Reports not using the source UNV will be skipped automatically by the mappings endpoint.")
     Write-Host ""
 
     $success = 0
@@ -289,24 +290,29 @@ try {
             continue
         }
 
-        # For each DP: GET mappings then POST mappings to apply the datasource change
-        $dpSuccess = $true
+        # For each DP: GET mappings then POST mappings to apply the datasource change.
+        # Mapping errors mean the DP uses a different universe - those DPs are skipped silently.
+        $remappedCount = 0
+        $remapFailed   = $false
         foreach ($dpId in $dpIds) {
             $mappingXml = Get-DPMappings $docId $dpId $TARGET_UNX_ID
-            if (-not $mappingXml) {
-                Write-Host ("  [SKIP DP] $dpId - could not retrieve mappings.") -ForegroundColor DarkYellow
-                continue
-            }
+            if (-not $mappingXml) { continue }   # different universe - skip this DP
             $applyStatus = Apply-DPMappings $docId $dpId $TARGET_UNX_ID $mappingXml
             if ($applyStatus -in @(200, 201, 204)) {
                 Write-Host ("  [OK] DP $dpId remapped.") -ForegroundColor Green
+                $remappedCount++
             } else {
                 Write-Host ("  [FAIL] DP $dpId remap HTTP $applyStatus") -ForegroundColor Red
-                $dpSuccess = $false
+                $remapFailed = $true
             }
         }
 
-        if ($dpSuccess) {
+        if ($remappedCount -eq 0) {
+            Write-Host "  [SKIP] No DPs use the source UNV - not a match." -ForegroundColor DarkGray
+            Close-BODocument $docId; continue
+        }
+
+        if (-not $remapFailed) {
             $saveStatus = Save-BODocument $docId
             if ($saveStatus -in @(200, 201, 204)) {
                 Write-Host "  [OK] Saved." -ForegroundColor Green
