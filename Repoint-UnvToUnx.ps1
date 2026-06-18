@@ -99,9 +99,9 @@ function Resolve-UniverseCuid($name) {
         Write-Host ("  [Universe Lookup sl Error] " + $_.Exception.Message) -ForegroundColor Red
     }
 
-    # Pass 2 - InfoStore CMS query (UNV files: SI_PROGID='CrystalEnterprise.Universe')
+    # Pass 2 - AppObjects CMS query (UNV files: CI_APPOBJECTS WHERE SI_KIND='Universe')
     try {
-        $query        = "SELECT SI_CUID,SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.Universe'"
+        $query        = "SELECT SI_CUID,SI_ID,SI_NAME FROM CI_APPOBJECTS WHERE SI_KIND='Universe'"
         $encodedQuery = [Uri]::EscapeDataString($query)
         $offset       = 0
         $limit        = 50
