@@ -7,9 +7,8 @@ $USERNAME    = "administrator"
 $PASSWORD    = "your_password"
 $AUTH_TYPE   = "secEnterprise"
 
-# Source UNV - specify EITHER the CUID or the filename
+# Source UNV name (as it appears in the CMS)
 $SOURCE_UNV_NAME = "MyUniverse.unv"
-$SOURCE_UNV_CUID = ""
 
 # Target UNX - specify EITHER the CUID or the filename
 $TARGET_UNX_NAME = "MyUniverse.unx"
@@ -73,14 +72,13 @@ function Invoke-BOLogoff {
     } catch { }
 }
 
-# Look up universe CUID by name.
+# Resolve a universe CUID by name.
 # Pass 1: sl/v1/universes (UNX universes).
-# Pass 2: InfoStore CMS query fallback (covers UNV universes not listed by sl/v1/universes).
+# Pass 2: CI_APPOBJECTS fallback (UNV universes).
 function Resolve-UniverseCuid($name) {
     $amp      = [char]38
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($name)
 
-    # Pass 1 - sl/v1/universes
     try {
         $page = 1
         do {
@@ -99,12 +97,10 @@ function Resolve-UniverseCuid($name) {
         Write-Host ("  [Universe Lookup sl Error] " + $_.Exception.Message) -ForegroundColor Red
     }
 
-    # Pass 2 - AppObjects CMS query (UNV files: CI_APPOBJECTS WHERE SI_KIND='Universe')
     try {
         $query        = "SELECT SI_CUID,SI_ID,SI_NAME FROM CI_APPOBJECTS WHERE SI_KIND='Universe'"
         $encodedQuery = [Uri]::EscapeDataString($query)
-        $offset       = 0
-        $limit        = 50
+        $offset       = 0; $limit = 50
         do {
             $url     = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
             $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
@@ -128,35 +124,19 @@ function Resolve-UniverseCuid($name) {
     return $null
 }
 
-function Show-Universes {
-    try {
-        $amp  = [char]38
-        $resp = Invoke-RestMethod -Uri ($SL + "/universes?page=1" + $amp + "pageSize=200") `
-            -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
-        $list = $null
-        if ($resp.universes -and $resp.universes.universe) { $list = @($resp.universes.universe) }
-        elseif ($resp.universe) { $list = @($resp.universe) }
-        if ($list) {
-            Write-Host ("  Available universes (" + $list.Count + "):") -ForegroundColor Gray
-            $list | ForEach-Object { Write-Host ("    " + $_.name + "  [CUID: " + $_.cuid + "]") -ForegroundColor Gray }
-        }
-    } catch {
-        Write-Host ("  [Universe List Error] " + $_.Exception.Message) -ForegroundColor Red
-    }
-}
-
-# List ONLY base WebI reports via infostore - excludes scheduled instances (SI_INSTANCE=0) and recurring schedule objects (SI_RECURRING=0)
-function Get-AllWebiDocs {
+# Find all base WebI reports linked to a universe using the PARENTS() CMS relationship query.
+# This is more reliable than CUID matching via data providers.
+function Get-LinkedWebiDocs($universeName) {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0 AND SI_RECURRING=0"
+    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE PARENTS(`"SI_NAME='webi-universe'`",`"SI_NAME='$universeName'`") AND SI_INSTANCE=0 AND SI_RECURRING=0"
 
     do {
         $encodedQuery = [Uri]::EscapeDataString($query)
-        $url  = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
-        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
+        $url     = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
+        $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
         $entries = $resp.entries
         if ($null -eq $entries) { $entries = $resp.entry }
         if ($entries) { $docs.AddRange([object[]](@($entries))) }
@@ -164,21 +144,6 @@ function Get-AllWebiDocs {
     } while ($entries -and (@($entries)).Count -eq $limit)
 
     return $docs
-}
-
-# Open a document into the Raylight session.
-# The Raylight API requires GET /documents/{id} before data providers return accurate data.
-function Open-BODocument($docId) {
-    try {
-        Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method GET ` 
-            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
-        return $true
-    } catch {
-        $code = $_.Exception.Response.StatusCode.value__
-        if ($code -eq 404) { return "skip" }
-        Write-Host ("  [Open Error] HTTP $code - " + $_.Exception.Message) -ForegroundColor DarkRed
-        return $false
-    }
 }
 
 # GET /dataproviders with retry on transient connection errors
@@ -192,7 +157,7 @@ function Get-DataProviders($docId) {
             if ($resp.dataprovider)  { return @($resp.dataprovider) }
             return @()
         } catch {
-            $msg = $_.Exception.Message
+            $msg  = $_.Exception.Message
             $code = $_.Exception.Response.StatusCode.value__
             if ($code -eq 404) { return "skip" }
             if ($i -lt 2 -and $msg -like "*connection was closed*") {
@@ -250,47 +215,36 @@ Write-Host ""
 Invoke-BOLogon
 
 try {
-    # Resolve CUIDs from names if not supplied
-    if (-not $SOURCE_UNV_CUID -and $SOURCE_UNV_NAME) {
-        Write-Host ("Resolving source UNV: " + $SOURCE_UNV_NAME) -ForegroundColor Gray
-        $SOURCE_UNV_CUID = Resolve-UniverseCuid $SOURCE_UNV_NAME
-        if ($SOURCE_UNV_CUID) {
-            Write-Host ("  CUID: " + $SOURCE_UNV_CUID) -ForegroundColor Gray
-        } else {
-            Write-Host "  Not found. Available universes:" -ForegroundColor Red
-            Show-Universes
-            throw "Aborting - source universe not found."
-        }
-    }
-
+    # Resolve target UNX CUID if not supplied directly
     if (-not $TARGET_UNX_CUID -and $TARGET_UNX_NAME) {
         Write-Host ("Resolving target UNX: " + $TARGET_UNX_NAME) -ForegroundColor Gray
         $TARGET_UNX_CUID = Resolve-UniverseCuid $TARGET_UNX_NAME
         if ($TARGET_UNX_CUID) {
             Write-Host ("  CUID: " + $TARGET_UNX_CUID) -ForegroundColor Gray
         } else {
-            Write-Host "  Not found. Available universes:" -ForegroundColor Red
-            Show-Universes
+            Write-Host "  Not found - set TARGET_UNX_CUID directly in config." -ForegroundColor Red
             throw "Aborting - target universe not found."
         }
     }
-
-    if (-not $SOURCE_UNV_CUID) { throw "SOURCE_UNV_CUID is empty - set name or CUID in config." }
     if (-not $TARGET_UNX_CUID) { throw "TARGET_UNX_CUID is empty - set name or CUID in config." }
 
     Write-Host ""
-    Write-Host (" Source : " + $SOURCE_UNV_NAME + "  [" + $SOURCE_UNV_CUID + "]")
-    Write-Host (" Target : " + $TARGET_UNX_NAME + "  [" + $TARGET_UNX_CUID + "]")
+    Write-Host (" Source UNV : " + $SOURCE_UNV_NAME)
+    Write-Host (" Target UNX : " + $TARGET_UNX_NAME + "  [" + $TARGET_UNX_CUID + "]")
     Write-Host ""
 
-    $docs = Get-AllWebiDocs
-    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " base WebI reports (SI_INSTANCE=0).")
+    # Use PARENTS() CMS query to find only reports directly linked to the source UNV
+    Write-Host ("Querying reports linked to: " + $SOURCE_UNV_NAME) -ForegroundColor Gray
+    $docs = Get-LinkedWebiDocs $SOURCE_UNV_NAME
+    Write-Host ("[" + (Get-Timestamp) + "] Found " + $docs.Count + " linked WebI report(s).")
     Write-Host ""
 
-    $success        = 0
-    $skippedNoMatch = 0
-    $failed         = 0
-    $seenCuids      = [System.Collections.Generic.HashSet[string]]::new()
+    if ($docs.Count -eq 0) {
+        Write-Host "  No reports found. Verify SOURCE_UNV_NAME matches the exact CMS name of the universe." -ForegroundColor Yellow
+    }
+
+    $success = 0
+    $failed  = 0
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
@@ -299,48 +253,25 @@ try {
                    elseif ($doc.SI_NAME) { $doc.SI_NAME }
                    else { "ID:" + $docId }
 
-        $dps = Get-DataProviders $docId
-        if ($dps -eq "skip")  { $skippedNoMatch++; continue }
-        if ($null -eq $dps)   { $failed++;         continue }
-        if ($dps.Count -eq 0) { $skippedNoMatch++; continue }
+        Write-Host ("[" + (Get-Timestamp) + "] Processing: " + $docName + " (ID:" + $docId + ")") -ForegroundColor Yellow
 
-        # On the first document, dump the raw data provider JSON to reveal the actual field structure
-        if ($success -eq 0 -and $skippedNoMatch -eq 0 -and $failed -eq 0) {
-            Write-Host "  [DEBUG] Raw data provider (first doc):" -ForegroundColor Magenta
-            Write-Host ($dps | ConvertTo-Json -Depth 6) -ForegroundColor Magenta
+        $dps = Get-DataProviders $docId
+        if ($dps -eq "skip" -or $null -eq $dps -or $dps.Count -eq 0) {
+            Write-Host "  [SKIP] Could not retrieve data providers." -ForegroundColor DarkYellow
+            $failed++
+            continue
         }
 
-        $dpInfo = ($dps | ForEach-Object {
-            $c = if     ($_.universe   -and $_.universe.cuid)            { $_.universe.cuid }
-                 elseif ($_.universe   -and $_.universe.id)              { $_.universe.id }
-                 elseif ($_.dataSource -and $_.dataSource.cuid)          { $_.dataSource.cuid }
-                 elseif ($_.dataSource -and $_.dataSource.connectionCuid){ $_.dataSource.connectionCuid }
-                 elseif ($_.cuid)                                        { $_.cuid }
-                 else { "?" }
-            $seenCuids.Add($c) | Out-Null
-            $_.id + "=" + $c
-        }) -join "  "
-        Write-Host ("  [SCAN] " + $docName + " | " + $dpInfo) -ForegroundColor DarkCyan
-
-        $matchedIds = @($dps | Where-Object {
-            ($_.universe   -and $_.universe.cuid            -eq $SOURCE_UNV_CUID) -or
-            ($_.universe   -and $_.universe.id              -eq $SOURCE_UNV_CUID) -or
-            ($_.dataSource -and $_.dataSource.cuid          -eq $SOURCE_UNV_CUID) -or
-            ($_.dataSource -and $_.dataSource.connectionCuid -eq $SOURCE_UNV_CUID) -or
-            ($_.cuid       -and $_.cuid                     -eq $SOURCE_UNV_CUID)
-        } | ForEach-Object { $_.id })
-
-        if ($matchedIds.Count -eq 0) { $skippedNoMatch++; continue }
-
-        Write-Host ("[" + (Get-Timestamp) + "] MATCH: " + $docName + " (ID:" + $docId + ") - DPs: " + ($matchedIds -join ", ")) -ForegroundColor Yellow
+        $dpIds = @($dps | ForEach-Object { $_.id })
+        Write-Host ("  Data providers: " + ($dpIds -join ", ")) -ForegroundColor Gray
 
         if ($DRY_RUN) {
-            Write-Host "  [DRY RUN] Would repoint." -ForegroundColor Gray
+            Write-Host "  [DRY RUN] Would repoint " + $dpIds.Count + " DP(s) to: " + $TARGET_UNX_NAME -ForegroundColor Gray
             $success++
             continue
         }
 
-        $status = Set-DataProviders $docId $matchedIds
+        $status = Set-DataProviders $docId $dpIds
         if ($status -in @(200, 204)) {
             Write-Host "  [OK] Repointed." -ForegroundColor Green
             $saveStatus = Save-BODocument $docId
@@ -360,17 +291,8 @@ try {
 
     Write-Host ""
     Write-Host $SEP -ForegroundColor Cyan
-    Write-Host (" DONE - Repointed: " + $success + " | No match: " + $skippedNoMatch + " | Failed: " + $failed) -ForegroundColor Cyan
+    Write-Host (" DONE - Repointed: " + $success + " | Failed: " + $failed) -ForegroundColor Cyan
     Write-Host $SEP -ForegroundColor Cyan
-
-    # If nothing matched, print the unique universe CUIDs seen across all reports to aid diagnosis
-    if ($success -eq 0 -and $skippedNoMatch -gt 0 -and $seenCuids.Count -gt 0) {
-        Write-Host ""
-        Write-Host "  [DIAG] No reports matched SOURCE_UNV_CUID: $SOURCE_UNV_CUID" -ForegroundColor Yellow
-        Write-Host "  [DIAG] Universe CUIDs actually seen in reports:" -ForegroundColor Yellow
-        $seenCuids | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor Yellow }
-        Write-Host "  [DIAG] If the correct CUID appears above, set SOURCE_UNV_CUID directly in config." -ForegroundColor Yellow
-    }
 
 } finally {
     Invoke-BOLogoff
