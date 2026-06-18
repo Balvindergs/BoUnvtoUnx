@@ -299,18 +299,23 @@ try {
                    elseif ($doc.SI_NAME) { $doc.SI_NAME }
                    else { "ID:" + $docId }
 
-        $opened = Open-BODocument $docId
-        if ($opened -eq "skip") { $skippedNoMatch++; continue }
-        if ($opened -eq $false) { $failed++;         continue }
-
         $dps = Get-DataProviders $docId
         if ($dps -eq "skip")  { $skippedNoMatch++; continue }
         if ($null -eq $dps)   { $failed++;         continue }
         if ($dps.Count -eq 0) { $skippedNoMatch++; continue }
 
+        # On the first document, dump the raw data provider JSON to reveal the actual field structure
+        if ($success -eq 0 -and $skippedNoMatch -eq 0 -and $failed -eq 0) {
+            Write-Host "  [DEBUG] Raw data provider (first doc):" -ForegroundColor Magenta
+            Write-Host ($dps | ConvertTo-Json -Depth 6) -ForegroundColor Magenta
+        }
+
         $dpInfo = ($dps | ForEach-Object {
-            $c = if ($_.universe -and $_.universe.cuid) { $_.universe.cuid }
-                 elseif ($_.dataSource -and $_.dataSource.cuid) { $_.dataSource.cuid }
+            $c = if     ($_.universe   -and $_.universe.cuid)            { $_.universe.cuid }
+                 elseif ($_.universe   -and $_.universe.id)              { $_.universe.id }
+                 elseif ($_.dataSource -and $_.dataSource.cuid)          { $_.dataSource.cuid }
+                 elseif ($_.dataSource -and $_.dataSource.connectionCuid){ $_.dataSource.connectionCuid }
+                 elseif ($_.cuid)                                        { $_.cuid }
                  else { "?" }
             $seenCuids.Add($c) | Out-Null
             $_.id + "=" + $c
@@ -318,8 +323,11 @@ try {
         Write-Host ("  [SCAN] " + $docName + " | " + $dpInfo) -ForegroundColor DarkCyan
 
         $matchedIds = @($dps | Where-Object {
-            ($_.universe   -and $_.universe.cuid   -eq $SOURCE_UNV_CUID) -or
-            ($_.dataSource -and $_.dataSource.cuid -eq $SOURCE_UNV_CUID)
+            ($_.universe   -and $_.universe.cuid            -eq $SOURCE_UNV_CUID) -or
+            ($_.universe   -and $_.universe.id              -eq $SOURCE_UNV_CUID) -or
+            ($_.dataSource -and $_.dataSource.cuid          -eq $SOURCE_UNV_CUID) -or
+            ($_.dataSource -and $_.dataSource.connectionCuid -eq $SOURCE_UNV_CUID) -or
+            ($_.cuid       -and $_.cuid                     -eq $SOURCE_UNV_CUID)
         } | ForEach-Object { $_.id })
 
         if ($matchedIds.Count -eq 0) { $skippedNoMatch++; continue }
