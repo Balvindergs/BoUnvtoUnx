@@ -166,6 +166,21 @@ function Get-AllWebiDocs {
     return $docs
 }
 
+# Open a document into the Raylight session.
+# The Raylight API requires GET /documents/{id} before data providers return accurate data.
+function Open-BODocument($docId) {
+    try {
+        Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method GET ` 
+            -Headers $script:AuthHeaders -WebSession $script:WebSession | Out-Null
+        return $true
+    } catch {
+        $code = $_.Exception.Response.StatusCode.value__
+        if ($code -eq 404) { return "skip" }
+        Write-Host ("  [Open Error] HTTP $code - " + $_.Exception.Message) -ForegroundColor DarkRed
+        return $false
+    }
+}
+
 # GET /dataproviders with retry on transient connection errors
 function Get-DataProviders($docId) {
     $url = $RAYLIGHT + "/documents/" + $docId + "/dataproviders"
@@ -283,6 +298,10 @@ try {
                    elseif ($doc.title)   { $doc.title }
                    elseif ($doc.SI_NAME) { $doc.SI_NAME }
                    else { "ID:" + $docId }
+
+        $opened = Open-BODocument $docId
+        if ($opened -eq "skip") { $skippedNoMatch++; continue }
+        if ($opened -eq $false) { $failed++;         continue }
 
         $dps = Get-DataProviders $docId
         if ($dps -eq "skip")  { $skippedNoMatch++; continue }
