@@ -115,13 +115,13 @@ function Show-Universes {
     }
 }
 
-# List ONLY base WebI reports (SI_INSTANCE=0) via infostore - excludes all scheduled instances
+# List ONLY base WebI reports via infostore - excludes scheduled instances (SI_INSTANCE=0) and recurring schedule objects (SI_RECURRING=0)
 function Get-AllWebiDocs {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0"
+    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0 AND SI_RECURRING=0"
 
     do {
         $encodedQuery = [Uri]::EscapeDataString($query)
