@@ -1,4 +1,4 @@
-﻿# ==============================================================
+# ==============================================================
 #  CONFIGURATION - update these values before running
 # ==============================================================
 $BO_SERVER   = "your_bo_server"
@@ -73,10 +73,15 @@ function Invoke-BOLogoff {
     } catch { }
 }
 
-# Look up universe CUID by name via sl/v1/universes
+# Look up universe CUID by name.
+# Pass 1: sl/v1/universes (UNX universes).
+# Pass 2: InfoStore CMS query fallback (covers UNV universes not listed by sl/v1/universes).
 function Resolve-UniverseCuid($name) {
+    $amp      = [char]38
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($name)
+
+    # Pass 1 - sl/v1/universes
     try {
-        $amp  = [char]38
         $page = 1
         do {
             $url  = $SL + "/universes?page=" + $page + $amp + "pageSize=100"
@@ -90,11 +95,37 @@ function Resolve-UniverseCuid($name) {
             }
             $page++
         } while ($list -and $list.Count -eq 100)
-        return $null
     } catch {
-        Write-Host ("  [Universe Lookup Error] " + $_.Exception.Message) -ForegroundColor Red
-        return $null
+        Write-Host ("  [Universe Lookup sl Error] " + $_.Exception.Message) -ForegroundColor Red
     }
+
+    # Pass 2 - InfoStore CMS query (UNV files: SI_PROGID='CrystalEnterprise.Universe')
+    try {
+        $query        = "SELECT SI_CUID,SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.Universe'"
+        $encodedQuery = [Uri]::EscapeDataString($query)
+        $offset       = 0
+        $limit        = 50
+        do {
+            $url     = $INFOSTORE + "?query=" + $encodedQuery + $amp + "offset=" + $offset + $amp + "limit=" + $limit
+            $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:AuthHeaders -WebSession $script:WebSession
+            $entries = if ($resp.entries) { @($resp.entries) } elseif ($resp.entry) { @($resp.entry) } else { $null }
+            if ($entries) {
+                $m = $entries | Where-Object {
+                    $n = if ($_.name) { $_.name } elseif ($_.title) { $_.title } else { "" }
+                    $n -eq $name -or $n -eq $baseName -or $n -like ($baseName + ".*")
+                } | Select-Object -First 1
+                if ($m) {
+                    $cuid = if ($m.cuid) { $m.cuid } elseif ($m.SI_CUID) { $m.SI_CUID } else { $null }
+                    if ($cuid) { return $cuid }
+                }
+            }
+            $offset += $limit
+        } while ($entries -and $entries.Count -eq $limit)
+    } catch {
+        Write-Host ("  [Universe Lookup CMS Error] " + $_.Exception.Message) -ForegroundColor Red
+    }
+
+    return $null
 }
 
 function Show-Universes {
@@ -244,6 +275,7 @@ try {
     $success        = 0
     $skippedNoMatch = 0
     $failed         = 0
+    $seenCuids      = [System.Collections.Generic.HashSet[string]]::new()
 
     foreach ($doc in $docs) {
         $docId   = $doc.id
@@ -261,6 +293,7 @@ try {
             $c = if ($_.universe -and $_.universe.cuid) { $_.universe.cuid }
                  elseif ($_.dataSource -and $_.dataSource.cuid) { $_.dataSource.cuid }
                  else { "?" }
+            $seenCuids.Add($c) | Out-Null
             $_.id + "=" + $c
         }) -join "  "
         Write-Host ("  [SCAN] " + $docName + " | " + $dpInfo) -ForegroundColor DarkCyan
@@ -302,6 +335,15 @@ try {
     Write-Host $SEP -ForegroundColor Cyan
     Write-Host (" DONE - Repointed: " + $success + " | No match: " + $skippedNoMatch + " | Failed: " + $failed) -ForegroundColor Cyan
     Write-Host $SEP -ForegroundColor Cyan
+
+    # If nothing matched, print the unique universe CUIDs seen across all reports to aid diagnosis
+    if ($success -eq 0 -and $skippedNoMatch -gt 0 -and $seenCuids.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  [DIAG] No reports matched SOURCE_UNV_CUID: $SOURCE_UNV_CUID" -ForegroundColor Yellow
+        Write-Host "  [DIAG] Universe CUIDs actually seen in reports:" -ForegroundColor Yellow
+        $seenCuids | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor Yellow }
+        Write-Host "  [DIAG] If the correct CUID appears above, set SOURCE_UNV_CUID directly in config." -ForegroundColor Yellow
+    }
 
 } finally {
     Invoke-BOLogoff
