@@ -131,7 +131,7 @@ function Get-LinkedWebiDocs($universeName) {
     $offset = 0
     $limit  = 50
     $amp    = [char]38
-    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE PARENTS(`"SI_NAME='webi-universe'`",`"SI_NAME='$universeName'`") AND SI_INSTANCE=0 AND SI_RECURRING=0"
+    $query  = "SELECT SI_ID,SI_NAME FROM CI_INFOOBJECTS WHERE PARENTS(`"SI_NAME='webi-universe'`",`"SI_NAME='$universeName'`") AND SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0 AND SI_RECURRING=0"
 
     do {
         $encodedQuery = [Uri]::EscapeDataString($query)
