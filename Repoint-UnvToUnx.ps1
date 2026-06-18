@@ -61,7 +61,6 @@ function Invoke-BOLogon {
         "X-SAP-LogonToken" = ('"' + $token + '"')
         "Accept"           = "application/json"
         "Content-Type"     = "application/json"
-        "Connection"       = "close"
     }
     Write-Host ("[" + (Get-Timestamp) + "] Logged in as " + $USERNAME) -ForegroundColor Green
 }
