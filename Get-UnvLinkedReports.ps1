@@ -34,18 +34,46 @@ Write-Host "Logged in." -ForegroundColor Green
 try {
     $amp = [char]38
 
-    # Step 1 — Fetch all dependent objects via /infostore/{SI_ID}/dependents
-    Write-Host "`nFetching dependents for universe SI_ID: $UNIVERSE_ID" -ForegroundColor Gray
-    $allDeps = [System.Collections.Generic.List[object]]::new()
-    $offset  = 0
+    # Step 1 — Fetch linked objects.
+    # Tries /children first; falls back to a CMS query using SI_UNIVERSE if not supported.
+    Write-Host "`nFetching reports linked to universe SI_ID: $UNIVERSE_ID" -ForegroundColor Gray
+    $allDeps     = [System.Collections.Generic.List[object]]::new()
+    $offset      = 0
+    $useChildren = $true
 
-    do {
-        $url     = $INFOSTORE + "/" + $UNIVERSE_ID + "/dependents?offset=" + $offset + $amp + "limit=50"
-        $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:Headers -WebSession $script:WebSession
-        $entries = if ($resp.entries) { @($resp.entries) } elseif ($resp.entry) { @($resp.entry) } else { $null }
-        if ($entries) { $allDeps.AddRange([object[]](@($entries))) }
-        $offset += 50
-    } while ($entries -and $entries.Count -eq 50)
+    try {
+        $testUrl = $INFOSTORE + "/" + $UNIVERSE_ID + "/children?offset=0" + $amp + "limit=1"
+        Invoke-RestMethod -Uri $testUrl -Method GET -Headers $script:Headers -WebSession $script:WebSession | Out-Null
+    } catch {
+        Write-Host "  /children not available, falling back to SI_UNIVERSE CMS query." -ForegroundColor Gray
+        $useChildren = $false
+    }
+
+    if ($useChildren) {
+        do {
+            $url     = $INFOSTORE + "/" + $UNIVERSE_ID + "/children?offset=" + $offset + $amp + "limit=50"
+            $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:Headers -WebSession $script:WebSession
+            $entries = if ($resp.entries) { @($resp.entries) } elseif ($resp.entry) { @($resp.entry) } else { $null }
+            if ($entries) { $allDeps.AddRange([object[]](@($entries))) }
+            $offset += 50
+        } while ($entries -and $entries.Count -eq 50)
+    } else {
+        # Fallback: query all WebI base reports and filter by SI_UNIVERSE containing the universe SI_ID
+        $q = [Uri]::EscapeDataString("SELECT SI_ID,SI_NAME,SI_OWNER,SI_UNIVERSE FROM CI_INFOOBJECTS WHERE SI_PROGID='CrystalEnterprise.WebiReport' AND SI_INSTANCE=0 AND SI_RECURRING=0")
+        do {
+            $url     = $INFOSTORE + "?query=" + $q + $amp + "offset=" + $offset + $amp + "limit=50"
+            $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:Headers -WebSession $script:WebSession
+            $entries = if ($resp.entries) { @($resp.entries) } elseif ($resp.entry) { @($resp.entry) } else { $null }
+            if ($entries) {
+                $matched = @($entries | Where-Object {
+                    $u = if ($_.universe) { $_.universe } elseif ($_.SI_UNIVERSE) { $_.SI_UNIVERSE } else { "" }
+                    $u -match $UNIVERSE_ID
+                })
+                if ($matched) { $allDeps.AddRange([object[]]$matched) }
+            }
+            $offset += 50
+        } while ($entries -and $entries.Count -eq 50)
+    }
 
     # Step 2 — Filter to WebI reports only
     $reports = @($allDeps | Where-Object {
