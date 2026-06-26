@@ -15,10 +15,10 @@ $DRY_RUN = $true   # Set to $false to actually save changes
 # ==============================================================
 
 # Raylight uses the SAME http://host:port base as logon (not HTTPS)
-$REST_BASE = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
+$REST_BASE = "http://" + $BO_SERVER + ":" + $BO_PORT + "/biprws"
 $RAYLIGHT  = $REST_BASE + "/raylight/v1"
-$INFOSTORE = "https://" + $BO_SERVER + "/biprws/infostore"
-$SL        = "https://" + $BO_SERVER + "/biprws/sl/v1"
+$INFOSTORE = $REST_BASE + "/infostore"
+$SL        = $REST_BASE + "/sl/v1"
 $SEP       = "=" * 60
 
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
