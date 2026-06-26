@@ -9,10 +9,10 @@ $AUTH_TYPE     = "secEnterprise"
 $UNIVERSE_NAME = "YOUR_UNIVERSE_NAME.unv"   # e.g. "Sales.unv" or just "Sales"
 # ==============================================================
 
-$REST_BASE = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
+$REST_BASE = "http://" + $BO_SERVER + ":" + $BO_PORT + "/biprws"
 $RAYLIGHT  = $REST_BASE + "/raylight/v1"
-$INFOSTORE = "https://" + $BO_SERVER + "/biprws/infostore"
-$SL        = "https://" + $BO_SERVER + "/biprws/sl/v1"
+$INFOSTORE = $REST_BASE + "/infostore"
+$SL        = $REST_BASE + "/sl/v1"
 $SEP       = "=" * 60
 
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
