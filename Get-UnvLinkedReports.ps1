@@ -7,6 +7,10 @@ $USERNAME      = "administrator"
 $PASSWORD      = "your_password"
 $AUTH_TYPE     = "secEnterprise"
 $UNIVERSE_NAME = "YOUR_UNIVERSE_NAME.unv"   # e.g. "Sales.unv" or just "Sales"
+
+# Set to $true to print raw Raylight XML for the first data provider found.
+# Use this to diagnose universe name matching if no linked reports are returned.
+$DEBUG_MODE    = $false
 # ==============================================================
 
 $REST_BASE = "http://" + $BO_SERVER + ":" + $BO_PORT + "/biprws"
@@ -28,6 +32,7 @@ $SEP       = "=" * 60
 $script:JsonHeaders = @{ "Content-Type" = "application/xml"; "Accept" = "application/json" }
 $script:XmlHeaders  = @{ "Content-Type" = "application/xml"; "Accept" = "application/xml" }
 $script:WebSession  = $null
+$script:DebugDone   = $false
 
 function Invoke-BOLogon {
     $xmlBody = "<attrs>" +
@@ -68,15 +73,12 @@ function Invoke-BOLogoff {
     } catch { }
 }
 
-# Resolve universe SI_ID using three strategies:
-#   1. SL /universes endpoint  (UNX and UNV)
-#   2. CI_APPOBJECTS SI_KIND='Universe'  (classic UNV)
-#   3. CI_INFOOBJECTS SI_KIND='Universe' (some BO configurations)
+# Resolve universe SI_ID - tries SL, CI_APPOBJECTS, CI_INFOOBJECTS
 function Resolve-UniverseSIID($name) {
     $amp      = [char]38
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($name)
 
-    # Strategy 1: SL universes endpoint
+    # Strategy 1: SL /universes endpoint
     try {
         $page = 1
         do {
@@ -101,7 +103,7 @@ function Resolve-UniverseSIID($name) {
         Write-Host ("  [SL lookup skipped] " + $_.Exception.Message) -ForegroundColor DarkGray
     }
 
-    # Strategy 2 & 3: CMS query against CI_APPOBJECTS then CI_INFOOBJECTS
+    # Strategy 2 & 3: CMS tables
     foreach ($table in @("CI_APPOBJECTS", "CI_INFOOBJECTS")) {
         try {
             $query    = "SELECT SI_ID,SI_NAME FROM $table WHERE SI_KIND='Universe'"
@@ -131,7 +133,7 @@ function Resolve-UniverseSIID($name) {
     return $null
 }
 
-# Get all base WebI reports from CMS
+# Get all base WebI reports
 function Get-AllWebiDocs {
     $docs   = [System.Collections.Generic.List[object]]::new()
     $offset = 0; $limit = 50; $amp = [char]38
@@ -179,24 +181,27 @@ function Get-DataProviderIDs($docId) {
     } catch { return @() }
 }
 
-# Check if a data provider's datasource matches the target universe (by SI_ID or name)
-function Test-DPUsesUniverse($docId, $dpId, $univId, $univName) {
+# Check if a data provider references the universe.
+# Uses raw XML string search to avoid XML structure assumptions.
+# If DEBUG_MODE is enabled, prints the raw XML of the first DP checked.
+function Test-DPUsesUniverse($docId, $dpId, $univName) {
     try {
-        $resp = Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId + "/dataproviders/" + $dpId) `
-            -Method GET -Headers $script:XmlHeaders -WebSession $script:WebSession
-        $ds = $null
-        if ($resp.dataprovider -and $resp.dataprovider.datasource) { $ds = $resp.dataprovider.datasource }
-        elseif ($resp.datasource) { $ds = $resp.datasource }
-        if (-not $ds) { return $false }
+        $raw  = Invoke-WebRequest -Uri ($RAYLIGHT + "/documents/" + $docId + "/dataproviders/" + $dpId) `
+            -Method GET -Headers $script:XmlHeaders -WebSession $script:WebSession -UseBasicParsing
+        $xml  = $raw.Content
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($univName)
 
-        $dsId   = if ($ds.id)   { [string]$ds.id }   else { "" }
-        $dsName = if ($ds.name) { [string]$ds.name }  else { "" }
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($univName)
+        if ($DEBUG_MODE -and -not $script:DebugDone) {
+            Write-Host ""
+            Write-Host "  [DEBUG] Raw DP XML:" -ForegroundColor Magenta
+            Write-Host $xml -ForegroundColor DarkYellow
+            Write-Host ""
+            $script:DebugDone = $true
+        }
 
-        return ($univId -and $dsId -eq $univId) -or
-               ($dsName -eq $univName) -or
-               ($dsName -eq $baseName) -or
-               ($dsName -like "*$baseName*")
+        # Search the raw XML for the universe name (handles any XML structure variant)
+        return ($xml -match [regex]::Escape($univName)) -or
+               ($xml -match [regex]::Escape($base))
     } catch { return $false }
 }
 
@@ -204,31 +209,36 @@ function Test-DPUsesUniverse($docId, $dpId, $univId, $univName) {
 Write-Host ""
 Write-Host $SEP -ForegroundColor Cyan
 Write-Host "  Get Reports Linked to Universe: $UNIVERSE_NAME" -ForegroundColor Cyan
+Write-Host ("  Server: http://" + $BO_SERVER + ":" + $BO_PORT) -ForegroundColor Cyan
 Write-Host $SEP -ForegroundColor Cyan
 Write-Host ""
 
 Invoke-BOLogon
 
 try {
-    # Step 1: Resolve universe SI_ID (tries SL, CI_APPOBJECTS, CI_INFOOBJECTS)
+    # Step 1: Resolve universe SI_ID (informational only - name matching still works without it)
     Write-Host "Resolving universe '$UNIVERSE_NAME' ..." -ForegroundColor Gray
     $univId = Resolve-UniverseSIID $UNIVERSE_NAME
     if ($univId) {
-        Write-Host ("  Universe SI_ID resolved: " + $univId) -ForegroundColor Green
+        Write-Host ("  Universe SI_ID: " + $univId) -ForegroundColor Green
     } else {
-        Write-Host ("  WARNING: Universe not found via any lookup strategy.") -ForegroundColor Yellow
-        Write-Host ("  Falling back to name-only matching against data provider datasource names.") -ForegroundColor Yellow
-        Write-Host ("  Tip: Check that UNIVERSE_NAME exactly matches the name in BO (with or without .unv).") -ForegroundColor Yellow
+        Write-Host ("  Universe SI_ID not resolved - will match by name in DP XML.") -ForegroundColor Yellow
+        Write-Host ("  Tip: Enable `$DEBUG_MODE=`$true to inspect the raw DP XML and verify the name.") -ForegroundColor Yellow
     }
     Write-Host ""
 
-    # Step 2: Fetch all WebI reports
+    # Step 2: Fetch all WebI base reports
     Write-Host "Fetching all base WebI reports ..." -ForegroundColor Gray
     $docs = Get-AllWebiDocs
     Write-Host ("  Total WebI reports: " + $docs.Count) -ForegroundColor Gray
+
+    if ($docs.Count -eq 0) {
+        Write-Host "  No WebI reports found. Check server connectivity and credentials." -ForegroundColor Red
+        return
+    }
     Write-Host ""
 
-    # Step 3: Open each report via Raylight and inspect data providers
+    # Step 3: Open each report and inspect data providers
     $linked  = [System.Collections.Generic.List[object]]::new()
     $counter = 0
 
@@ -241,13 +251,24 @@ try {
         Write-Host ("  [$counter/$($docs.Count)] $docName") -ForegroundColor DarkGray
 
         $opened = Open-BODocument $docId
-        if ($opened -eq "skip") { continue }
-        if ($opened -eq $false) { continue }
+        if ($opened -eq "skip") {
+            Write-Host "    [SKIP] Not found via Raylight." -ForegroundColor DarkYellow
+            continue
+        }
+        if ($opened -eq $false) {
+            Write-Host "    [ERROR] Could not open." -ForegroundColor Red
+            continue
+        }
 
         $dpIds    = Get-DataProviderIDs $docId
+        if ($dpIds.Count -eq 0) {
+            Close-BODocument $docId
+            continue
+        }
+
         $isLinked = $false
         foreach ($dpId in $dpIds) {
-            if (Test-DPUsesUniverse $docId $dpId $univId $UNIVERSE_NAME) {
+            if (Test-DPUsesUniverse $docId $dpId $UNIVERSE_NAME) {
                 $isLinked = $true
                 break
             }
@@ -261,7 +282,7 @@ try {
         }
     }
 
-    # Output results
+    # Results
     Write-Host ""
     Write-Host $SEP -ForegroundColor Cyan
     Write-Host ("  Reports linked to '$UNIVERSE_NAME': " + $linked.Count) -ForegroundColor Yellow
@@ -270,6 +291,10 @@ try {
         $linked | ForEach-Object {
             Write-Host ("  ID: {0,-10} Owner: {1,-20} Name: {2}" -f $_.ID, $_.Owner, $_.Name)
         }
+        Write-Host $SEP -ForegroundColor Cyan
+    } else {
+        Write-Host "  No linked reports found." -ForegroundColor DarkYellow
+        Write-Host "  If unexpected, set `$DEBUG_MODE=`$true and re-run to inspect the DP XML." -ForegroundColor DarkYellow
         Write-Host $SEP -ForegroundColor Cyan
     }
 
