@@ -12,6 +12,7 @@ $UNIVERSE_NAME = "YOUR_UNIVERSE_NAME.unv"   # e.g. "Sales.unv" or just "Sales"
 $REST_BASE = "http://"  + $BO_SERVER + ":" + $BO_PORT + "/biprws"
 $RAYLIGHT  = $REST_BASE + "/raylight/v1"
 $INFOSTORE = "https://" + $BO_SERVER + "/biprws/infostore"
+$SL        = "https://" + $BO_SERVER + "/biprws/sl/v1"
 $SEP       = "=" * 60
 
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
@@ -67,26 +68,66 @@ function Invoke-BOLogoff {
     } catch { }
 }
 
-# Resolve UNV universe SI_ID from CI_APPOBJECTS
-function Resolve-UnvSIID($name) {
+# Resolve universe SI_ID using three strategies:
+#   1. SL /universes endpoint  (UNX and UNV)
+#   2. CI_APPOBJECTS SI_KIND='Universe'  (classic UNV)
+#   3. CI_INFOOBJECTS SI_KIND='Universe' (some BO configurations)
+function Resolve-UniverseSIID($name) {
     $amp      = [char]38
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($name)
-    $query    = "SELECT SI_ID,SI_NAME FROM CI_APPOBJECTS WHERE SI_KIND='Universe'"
-    $encodedQ = [Uri]::EscapeDataString($query)
-    $offset = 0; $limit = 50
-    do {
-        $url     = $INFOSTORE + "?query=" + $encodedQ + $amp + "offset=" + $offset + $amp + "limit=" + $limit
-        $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:JsonHeaders -WebSession $script:WebSession
-        $entries = if ($resp.entries) { @($resp.entries) } elseif ($resp.entry) { @($resp.entry) } else { $null }
-        if ($entries) {
-            $m = $entries | Where-Object {
-                $n = if ($_.name) { $_.name } elseif ($_.title) { $_.title } else { "" }
-                $n -eq $name -or $n -eq $baseName -or $n -like ($baseName + ".*")
-            } | Select-Object -First 1
-            if ($m -and $m.id) { return [string]$m.id }
+
+    # Strategy 1: SL universes endpoint
+    try {
+        $page = 1
+        do {
+            $url  = $SL + "/universes?page=" + $page + $amp + "pageSize=100"
+            $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $script:JsonHeaders -WebSession $script:WebSession
+            $list = $null
+            if ($resp.universes -and $resp.universes.universe) { $list = @($resp.universes.universe) }
+            elseif ($resp.universe) { $list = @($resp.universe) }
+            if ($list) {
+                $m = $list | Where-Object {
+                    $_.name -eq $name -or $_.name -eq $baseName -or
+                    $_.fileName -eq $name -or $_.fileName -eq $baseName
+                } | Select-Object -First 1
+                if ($m -and $m.id) {
+                    Write-Host ("  [SL] Found '$($m.name)'  SI_ID=" + $m.id) -ForegroundColor Gray
+                    return [string]$m.id
+                }
+            }
+            $page++
+        } while ($list -and $list.Count -eq 100)
+    } catch {
+        Write-Host ("  [SL lookup skipped] " + $_.Exception.Message) -ForegroundColor DarkGray
+    }
+
+    # Strategy 2 & 3: CMS query against CI_APPOBJECTS then CI_INFOOBJECTS
+    foreach ($table in @("CI_APPOBJECTS", "CI_INFOOBJECTS")) {
+        try {
+            $query    = "SELECT SI_ID,SI_NAME FROM $table WHERE SI_KIND='Universe'"
+            $encodedQ = [Uri]::EscapeDataString($query)
+            $offset   = 0; $limit = 50
+            do {
+                $url     = $INFOSTORE + "?query=" + $encodedQ + $amp + "offset=" + $offset + $amp + "limit=" + $limit
+                $resp    = Invoke-RestMethod -Uri $url -Method GET -Headers $script:JsonHeaders -WebSession $script:WebSession
+                $entries = if ($resp.entries) { @($resp.entries) } elseif ($resp.entry) { @($resp.entry) } else { $null }
+                if ($entries) {
+                    $m = $entries | Where-Object {
+                        $n = if ($_.name) { $_.name } elseif ($_.title) { $_.title } else { "" }
+                        $n -eq $name -or $n -eq $baseName -or $n -like ($baseName + ".*")
+                    } | Select-Object -First 1
+                    if ($m -and $m.id) {
+                        Write-Host ("  [$table] Found '$($m.name)'  SI_ID=" + $m.id) -ForegroundColor Gray
+                        return [string]$m.id
+                    }
+                }
+                $offset += $limit
+            } while ($entries -and $entries.Count -eq $limit)
+        } catch {
+            Write-Host ("  [$table lookup skipped] " + $_.Exception.Message) -ForegroundColor DarkGray
         }
-        $offset += $limit
-    } while ($entries -and $entries.Count -eq $limit)
+    }
+
     return $null
 }
 
@@ -107,7 +148,6 @@ function Get-AllWebiDocs {
     return $docs
 }
 
-# Open document in Raylight session (read-only GET)
 function Open-BODocument($docId) {
     try {
         Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId) -Method GET `
@@ -127,7 +167,6 @@ function Close-BODocument($docId) {
     } catch { }
 }
 
-# Get all data provider IDs for an open document
 function Get-DataProviderIDs($docId) {
     try {
         $resp = Invoke-RestMethod -Uri ($RAYLIGHT + "/documents/" + $docId + "/dataproviders") `
@@ -171,20 +210,22 @@ Write-Host ""
 Invoke-BOLogon
 
 try {
-    # Step 1: Resolve universe SI_ID
-    Write-Host "Resolving universe '$UNIVERSE_NAME' in CMS ..." -ForegroundColor Gray
-    $univId = Resolve-UnvSIID $UNIVERSE_NAME
+    # Step 1: Resolve universe SI_ID (tries SL, CI_APPOBJECTS, CI_INFOOBJECTS)
+    Write-Host "Resolving universe '$UNIVERSE_NAME' ..." -ForegroundColor Gray
+    $univId = Resolve-UniverseSIID $UNIVERSE_NAME
     if ($univId) {
-        Write-Host ("  SI_ID: " + $univId) -ForegroundColor Gray
+        Write-Host ("  Universe SI_ID resolved: " + $univId) -ForegroundColor Green
     } else {
-        Write-Host "  WARNING: Universe not found in CI_APPOBJECTS. Will match by name only." -ForegroundColor Yellow
+        Write-Host ("  WARNING: Universe not found via any lookup strategy.") -ForegroundColor Yellow
+        Write-Host ("  Falling back to name-only matching against data provider datasource names.") -ForegroundColor Yellow
+        Write-Host ("  Tip: Check that UNIVERSE_NAME exactly matches the name in BO (with or without .unv).") -ForegroundColor Yellow
     }
     Write-Host ""
 
     # Step 2: Fetch all WebI reports
     Write-Host "Fetching all base WebI reports ..." -ForegroundColor Gray
     $docs = Get-AllWebiDocs
-    Write-Host ("  Total WebI reports found: " + $docs.Count) -ForegroundColor Gray
+    Write-Host ("  Total WebI reports: " + $docs.Count) -ForegroundColor Gray
     Write-Host ""
 
     # Step 3: Open each report via Raylight and inspect data providers
